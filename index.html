@@ -191,6 +191,20 @@
     .bind-btn.listening{animation:none;background:#0d2e2c}
   }
 
+  /* ---- saved profiles ----------------------------------------------- */
+  .prow{
+    display:flex;align-items:center;gap:8px;
+    padding:6px 8px;border:1px solid var(--board-edge);
+    background:#081c17;margin-bottom:6px;
+  }
+  .prow span{
+    flex:1;min-width:0;font-family:var(--font-mono);font-size:11.5px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .prow button{padding:4px 9px;font-size:10px}
+  .prow button.del:hover{border-color:var(--fault);color:var(--fault)}
+  .empty{color:var(--silk-dim);font-size:11.5px;font-style:italic}
+
   /* ---- cfg preview -------------------------------------------------- */
   pre.cfg{
     margin:0;padding:12px 14px;background:#081c17;
@@ -267,6 +281,11 @@
           </div>
         </div>
 
+        <label class="field" style="margin-top:4px">
+          <span>Shader <span class="pill">GLSL only</span></span>
+          <select id="shaderSelect"></select>
+        </label>
+
         <div class="btn-row" style="margin-top:14px">
           <button class="primary" id="launchBtn" disabled>Start</button>
           <button id="applyBtn" disabled>Apply bindings</button>
@@ -331,6 +350,17 @@
       </div>
       <div class="panel-body" style="border-top:1px solid var(--board-edge)">
         <p class="note" style="margin:0">Click a cell, then press the key or button you want. <span class="pill">Esc</span> cancels, <span class="pill">Backspace</span> clears.</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Saved profiles</h2>
+      <div class="panel-body">
+        <div class="row" style="margin-bottom:10px">
+          <input type="text" id="profileName" placeholder="name this profile">
+          <button id="saveProfile" style="flex:0 0 auto">Save</button>
+        </div>
+        <div id="profileList"></div>
       </div>
     </section>
 
@@ -425,6 +455,63 @@ const LAYOUTS = {
 };
 
 /* =====================================================================
+   Shaders
+   WebGL means GLSL only — slang presets (crt-royale, guest-advanced and
+   most other modern chains) cannot run here at all. These come from the
+   libretro glsl-shaders repo via jsDelivr.
+   ===================================================================== */
+const SHADER_BASE = 'https://cdn.jsdelivr.net/gh/libretro/glsl-shaders@master/';
+
+const SHADERS = [
+  ['',                                  'None'],
+  ['crt/crt-geom.glslp',                'CRT Geom — curved, classic'],
+  ['crt/crt-easymode.glslp',            'CRT EasyMode — sharp, cheap'],
+  ['crt/crt-aperture.glslp',            'CRT Aperture — grille'],
+  ['crt/crt-caligari.glslp',            'CRT Caligari — soft phosphor'],
+  ['crt/zfast-crt.glslp',               'zfast CRT — for weak GPUs'],
+  ['handheld/lcd3x.glslp',              'LCD3x — handheld grid'],
+  ['scanlines/scanlines.glslp',         'Scanlines — plain'],
+  ['interpolation/sharp-bilinear.glslp','Sharp bilinear — clean scaling'],
+];
+
+// Where RetroArch will look for the preset inside the virtual filesystem.
+const SHADER_DIR = '/home/web_user/retroarch/userdata/shaders';
+
+/* =====================================================================
+   IndexedDB — saved input profiles
+   Entirely client-side: this is the visitor's own browser storage, so
+   nothing is uploaded and nothing is distributed.
+   ===================================================================== */
+const DB_NAME = 'panel', DB_STORE = 'profiles';
+
+function idb(){
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(DB_STORE)){
+        req.result.createObjectStore(DB_STORE, { keyPath:'name' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+function tx(mode, fn){
+  return idb().then(db => new Promise((resolve, reject) => {
+    const t = db.transaction(DB_STORE, mode);
+    const req = fn(t.objectStore(DB_STORE));
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  }));
+}
+
+const dbPut  = rec  => tx('readwrite', s => s.put(rec));
+const dbAll  = ()   => tx('readonly',  s => s.getAll());
+const dbGet  = name => tx('readonly',  s => s.get(name));
+const dbDel  = name => tx('readwrite', s => s.delete(name));
+
+/* =====================================================================
    Keyboard: DOM KeyboardEvent.code  ->  RetroArch key name
    RetroArch has its own key namespace. Verify additions against
    docs.libretro.com's retroarch.cfg reference before trusting them.
@@ -465,6 +552,7 @@ const state = {
   padId: {1:null,2:null},     // gamepad.id string, for import warnings
   labels: {},                 // padId -> friendly name (the "layout")
   layoutName: 'generic',
+  shader: '',                 // path within the glsl-shaders repo
   gameName: '',
   editPlayer: 1,
   listening: null,            // {player, padId, kind:'key'|'pad'}
@@ -509,6 +597,18 @@ coreSelect.value = 'fbneo';
 coreSelect.addEventListener('change', () => {
   $('customCoreField').hidden = coreSelect.value !== '__custom__';
 });
+
+/* =====================================================================
+   Shader selector
+   ===================================================================== */
+const shaderSelect = $('shaderSelect');
+for (const [value, label] of SHADERS){
+  const opt = document.createElement('option');
+  opt.value = value;
+  opt.textContent = label;
+  shaderSelect.appendChild(opt);
+}
+shaderSelect.addEventListener('change', e => { state.shader = e.target.value; });
 
 /* =====================================================================
    File drops
@@ -559,6 +659,62 @@ async function resolveCore(){
   if (!/^https?:\/\//.test(core)) return { core };
 
   return { core:{ name:'custom', js:core, wasm:core.replace(/\.js$/,'.wasm') } };
+}
+
+/* =====================================================================
+   Shader loading
+   A .glslp preset references its passes by relative path. We fetch the
+   preset, pull out every shaderN entry, fetch each pass, and rewrite the
+   preset so every reference is a flat filename in one directory. That
+   sidesteps having to recreate the repo's tree inside the VFS.
+   ===================================================================== */
+async function fetchShader(presetPath){
+  if (!presetPath) return null;
+
+  const presetUrl = SHADER_BASE + presetPath;
+  log(`Fetching shader: ${presetPath}`);
+
+  const res = await fetch(presetUrl);
+  if (!res.ok) throw new Error(`Shader preset ${presetPath} → HTTP ${res.status}`);
+  let text = await res.text();
+
+  const dir = presetPath.slice(0, presetPath.lastIndexOf('/') + 1);
+  const files = [];
+
+  // shader0 = ../foo/bar.glsl   (quotes optional)
+  const entries = [...text.matchAll(/^\s*(shader\d+)\s*=\s*"?([^"\r\n]+)"?\s*$/gm)];
+
+  for (const [, key, rawPath] of entries){
+    // Resolve the pass relative to the preset, then flatten the name.
+    const abs  = new URL(rawPath, presetUrl).href;
+    const flat = abs.split('/').pop();
+
+    const r = await fetch(abs);
+    if (!r.ok) throw new Error(`Shader pass ${flat} → HTTP ${r.status}`);
+    files.push({ name: flat, content: await r.text() });
+
+    // Point the preset at the flattened name.
+    text = text.replace(
+      new RegExp(`^\\s*${key}\\s*=.*$`, 'm'),
+      `${key} = "${flat}"`
+    );
+  }
+
+  const presetName = presetPath.split('/').pop();
+  files.push({ name: presetName, content: text });
+
+  log(`Shader ready: ${entries.length} pass(es)`, 'ok');
+  return { presetName, files };
+}
+
+// Emscripten's FS has no recursive mkdir in every build, so walk it.
+function mkdirTree(FS, path){
+  let cur = '';
+  for (const part of path.split('/')){
+    if (!part) continue;
+    cur += '/' + part;
+    try { FS.mkdir(cur); } catch { /* already exists */ }
+  }
 }
 
 /* =====================================================================
@@ -802,6 +958,7 @@ $('exportLayout').addEventListener('click', () => {
     core: coreSelect.value,
     preset: state.layoutName,
     labels: state.labels,
+    shader: state.shader,
   }, `${state.gameName || 'layout'}.layout.json`);
   log('Layout exported', 'ok');
 });
@@ -838,6 +995,16 @@ $('jsonPicker').addEventListener('change', async () => {
       if (data.core && [...coreSelect.options].some(o => o.value === data.core)){
         coreSelect.value = data.core;
       }
+      if (typeof data.shader === 'string'){
+        state.shader = data.shader;
+        // An unknown preset path still applies — it just won't be in the
+        // dropdown, so show the closest thing rather than silently reset.
+        shaderSelect.value = [...shaderSelect.options].some(o => o.value === data.shader)
+          ? data.shader : '';
+        if (data.shader && shaderSelect.value !== data.shader){
+          log(`Layout uses shader "${data.shader}" — not in the list, but will be fetched`, 'ok');
+        }
+      }
       log(`Layout for "${data.game}" imported`, 'ok');
 
     } else {
@@ -851,11 +1018,99 @@ $('jsonPicker').addEventListener('change', async () => {
 });
 
 /* =====================================================================
+   Saved profiles (IndexedDB)
+   ===================================================================== */
+function currentProfile(){
+  return {
+    devices: { 1: state.padId[1], 2: state.padId[2] },
+    joypadIndex: { ...state.padIndex },
+    keys: structuredClone(state.keys),
+    pads: structuredClone(state.pads),
+  };
+}
+
+function applyProfile(p){
+  state.keys     = p.keys ?? state.keys;
+  state.pads     = p.pads ?? state.pads;
+  state.padIndex = p.joypadIndex ?? state.padIndex;
+  renderTable();
+}
+
+async function refreshProfiles(){
+  const list = $('profileList');
+  list.textContent = '';
+  let rows;
+  try {
+    rows = await dbAll();
+  } catch (err){
+    list.innerHTML = '<div class="empty">Storage unavailable in this browser.</div>';
+    return;
+  }
+  if (!rows.length){
+    list.innerHTML = '<div class="empty">Nothing saved yet.</div>';
+    return;
+  }
+  for (const rec of rows.sort((a,b) => a.name.localeCompare(b.name))){
+    const row = document.createElement('div');
+    row.className = 'prow';
+
+    const name = document.createElement('span');
+    name.textContent = rec.name;
+    row.appendChild(name);
+
+    const load = document.createElement('button');
+    load.textContent = 'Load';
+    load.addEventListener('click', () => {
+      applyProfile(rec.profile);
+      log(`Loaded profile "${rec.name}"`, 'ok');
+    });
+    row.appendChild(load);
+
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = 'Delete';
+    del.addEventListener('click', async () => {
+      await dbDel(rec.name);
+      refreshProfiles();
+    });
+    row.appendChild(del);
+
+    list.appendChild(row);
+  }
+}
+
+$('saveProfile').addEventListener('click', async () => {
+  const name = $('profileName').value.trim();
+  if (!name){ log('Give the profile a name first', 'err'); return; }
+  try {
+    await dbPut({ name, profile: currentProfile(), saved: Date.now() });
+    $('profileName').value = '';
+    refreshProfiles();
+    log(`Saved profile "${name}"`, 'ok');
+  } catch (err){
+    log(`Could not save: ${err.message}`, 'err');
+  }
+});
+
+$('profileName').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('saveProfile').click();
+});
+
+/* =====================================================================
    Launch
    ===================================================================== */
 async function launch(savedState = null){
   const { core } = await resolveCore();
   log(`Launching ${typeof core === 'string' ? core : 'custom core'}…`);
+
+  // Shader files have to exist in the VFS before RetroArch reads the
+  // config, so they go in via preRun rather than after launch.
+  let shader = null;
+  try {
+    shader = await fetchShader(state.shader);
+  } catch (err){
+    log(`Shader failed, continuing without it: ${err.message}`, 'err');
+  }
 
   const opts = {
     core,
@@ -870,10 +1125,22 @@ async function launch(savedState = null){
       // real reason for a failed content load never reaches the log.
       log_verbosity: 'true',
       frontend_log_level: '0',
+      ...(shader ? {
+        video_shader_enable: 'true',
+        video_shader: `${SHADER_DIR}/${shader.presetName}`,
+      } : { video_shader_enable: 'false' }),
     },
     emscriptenModule: {
       print:    msg => log(msg),
       printErr: msg => log(msg, 'err'),
+      preRun: shader ? [ mod => {
+        const FS = mod?.FS ?? globalThis.FS;
+        if (!FS){ console.warn('No FS at preRun — shader not written'); return; }
+        mkdirTree(FS, SHADER_DIR);
+        for (const f of shader.files){
+          FS.writeFile(`${SHADER_DIR}/${f.name}`, f.content);
+        }
+      } ] : [],
     },
   };
   if (state.bios.length){
@@ -951,6 +1218,7 @@ $('stopBtn').addEventListener('click', async () => {
    ===================================================================== */
 updatePadStatus();
 renderTable();
+refreshProfiles();
 log('Ready. Load a ROM to start.');
 </script>
 </body>
