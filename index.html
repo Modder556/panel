@@ -457,25 +457,20 @@ const LAYOUTS = {
 /* =====================================================================
    Shaders
    WebGL means GLSL only — slang presets (crt-royale, guest-advanced and
-   most other modern chains) cannot run here at all. These come from the
-   libretro glsl-shaders repo via jsDelivr.
+   most other modern chains) cannot run here at all.
+   Nostalgist resolves these names against libretro/glsl-shaders itself,
+   so 'crt/crt-easymode' loads crt/crt-easymode.glslp plus
+   crt/shaders/crt-easymode.glsl. No .glslp extension here.
    ===================================================================== */
-const SHADER_BASE = 'https://cdn.jsdelivr.net/gh/libretro/glsl-shaders@master/';
-
 const SHADERS = [
-  ['',                                  'None'],
-  ['crt/crt-geom.glslp',                'CRT Geom — curved, classic'],
-  ['crt/crt-easymode.glslp',            'CRT EasyMode — sharp, cheap'],
-  ['crt/crt-aperture.glslp',            'CRT Aperture — grille'],
-  ['crt/crt-caligari.glslp',            'CRT Caligari — soft phosphor'],
-  ['crt/zfast-crt.glslp',               'zfast CRT — for weak GPUs'],
-  ['handheld/lcd3x.glslp',              'LCD3x — handheld grid'],
-  ['scanlines/scanlines.glslp',         'Scanlines — plain'],
-  ['interpolation/sharp-bilinear.glslp','Sharp bilinear — clean scaling'],
+  ['',                        'None'],
+  ['crt/crt-easymode',        'CRT EasyMode — sharp, cheap'],
+  ['crt/crt-geom',            'CRT Geom — curved, classic'],
+  ['crt/crt-aperture',        'CRT Aperture — grille'],
+  ['crt/zfast-crt',           'zfast CRT — for weak GPUs'],
+  ['handheld/lcd3x',          'LCD3x — handheld grid'],
+  ['handheld/zfast-lcd',      'zfast LCD'],
 ];
-
-// Where RetroArch will look for the preset inside the virtual filesystem.
-const SHADER_DIR = '/home/web_user/retroarch/userdata/shaders';
 
 /* =====================================================================
    IndexedDB — saved input profiles
@@ -659,62 +654,6 @@ async function resolveCore(){
   if (!/^https?:\/\//.test(core)) return { core };
 
   return { core:{ name:'custom', js:core, wasm:core.replace(/\.js$/,'.wasm') } };
-}
-
-/* =====================================================================
-   Shader loading
-   A .glslp preset references its passes by relative path. We fetch the
-   preset, pull out every shaderN entry, fetch each pass, and rewrite the
-   preset so every reference is a flat filename in one directory. That
-   sidesteps having to recreate the repo's tree inside the VFS.
-   ===================================================================== */
-async function fetchShader(presetPath){
-  if (!presetPath) return null;
-
-  const presetUrl = SHADER_BASE + presetPath;
-  log(`Fetching shader: ${presetPath}`);
-
-  const res = await fetch(presetUrl);
-  if (!res.ok) throw new Error(`Shader preset ${presetPath} → HTTP ${res.status}`);
-  let text = await res.text();
-
-  const dir = presetPath.slice(0, presetPath.lastIndexOf('/') + 1);
-  const files = [];
-
-  // shader0 = ../foo/bar.glsl   (quotes optional)
-  const entries = [...text.matchAll(/^\s*(shader\d+)\s*=\s*"?([^"\r\n]+)"?\s*$/gm)];
-
-  for (const [, key, rawPath] of entries){
-    // Resolve the pass relative to the preset, then flatten the name.
-    const abs  = new URL(rawPath, presetUrl).href;
-    const flat = abs.split('/').pop();
-
-    const r = await fetch(abs);
-    if (!r.ok) throw new Error(`Shader pass ${flat} → HTTP ${r.status}`);
-    files.push({ name: flat, content: await r.text() });
-
-    // Point the preset at the flattened name.
-    text = text.replace(
-      new RegExp(`^\\s*${key}\\s*=.*$`, 'm'),
-      `${key} = "${flat}"`
-    );
-  }
-
-  const presetName = presetPath.split('/').pop();
-  files.push({ name: presetName, content: text });
-
-  log(`Shader ready: ${entries.length} pass(es)`, 'ok');
-  return { presetName, files };
-}
-
-// Emscripten's FS has no recursive mkdir in every build, so walk it.
-function mkdirTree(FS, path){
-  let cur = '';
-  for (const part of path.split('/')){
-    if (!part) continue;
-    cur += '/' + part;
-    try { FS.mkdir(cur); } catch { /* already exists */ }
-  }
 }
 
 /* =====================================================================
@@ -1103,15 +1042,6 @@ async function launch(savedState = null){
   const { core } = await resolveCore();
   log(`Launching ${typeof core === 'string' ? core : 'custom core'}…`);
 
-  // Shader files have to exist in the VFS before RetroArch reads the
-  // config, so they go in via preRun rather than after launch.
-  let shader = null;
-  try {
-    shader = await fetchShader(state.shader);
-  } catch (err){
-    log(`Shader failed, continuing without it: ${err.message}`, 'err');
-  }
-
   const opts = {
     core,
     // MAME derives the driver shortname from the filename, so the name has
@@ -1125,24 +1055,19 @@ async function launch(savedState = null){
       // real reason for a failed content load never reaches the log.
       log_verbosity: 'true',
       frontend_log_level: '0',
-      ...(shader ? {
-        video_shader_enable: 'true',
-        video_shader: `${SHADER_DIR}/${shader.presetName}`,
-      } : { video_shader_enable: 'false' }),
     },
     emscriptenModule: {
       print:    msg => log(msg),
       printErr: msg => log(msg, 'err'),
-      preRun: shader ? [ mod => {
-        const FS = mod?.FS ?? globalThis.FS;
-        if (!FS){ console.warn('No FS at preRun — shader not written'); return; }
-        mkdirTree(FS, SHADER_DIR);
-        for (const f of shader.files){
-          FS.writeFile(`${SHADER_DIR}/${f.name}`, f.content);
-        }
-      } ] : [],
     },
   };
+
+  // Nostalgist resolves the .glslp and its passes from libretro/glsl-shaders
+  // and wires them up itself — no manual filesystem work needed.
+  if (state.shader){
+    opts.shader = state.shader;
+    log(`Shader: ${state.shader}`);
+  }
   if (state.bios.length){
     opts.bios = state.bios.map(f => ({ fileName: f.name, fileContent: f }));
   }
