@@ -191,6 +191,23 @@
     .bind-btn.listening{animation:none;background:#0d2e2c}
   }
 
+  /* ---- dip switches --------------------------------------------------- */
+  .dip{
+    display:flex;align-items:center;gap:8px;
+    padding:5px 0;border-bottom:1px solid rgba(27,74,61,.5);
+  }
+  .dip:last-child{border-bottom:none}
+  .dip label{
+    flex:1;min-width:0;font-size:12px;color:var(--silk);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .dip input{
+    flex:0 0 150px;background:#081c17;border:1px solid var(--board-edge);
+    color:var(--silk);padding:4px 7px;font-family:var(--font-mono);font-size:11.5px;
+  }
+  .dip.changed input{border-color:var(--gold);color:var(--gold)}
+  .dip.changed label::after{content:" *";color:var(--gold)}
+
   /* ---- saved profiles ----------------------------------------------- */
   .prow{
     display:flex;align-items:center;gap:8px;
@@ -288,10 +305,29 @@
 
         <div class="btn-row" style="margin-top:14px">
           <button class="primary" id="launchBtn" disabled>Start</button>
-          <button id="applyBtn" disabled>Apply bindings</button>
+          <button id="applyBtn" disabled>Apply changes</button>
           <button id="stopBtn" disabled>Stop</button>
         </div>
-        <p class="note">Applying bindings saves state, relaunches with the new config, and restores the state. RetroArch reads input config at boot, so there's no way around the round-trip.</p>
+        <p class="note">Applying saves state, relaunches with the new config, and restores the state. RetroArch reads input, shader, and core options at boot, so there's no way around the round-trip.</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>DIP switches &amp; core options</h2>
+      <div class="panel-body">
+        <div class="row" style="margin-bottom:10px">
+          <label class="field" style="margin-bottom:0">
+            <span>Show</span>
+            <select id="dipFilter">
+              <option value="dip">DIP switches only</option>
+              <option value="all">All core options</option>
+            </select>
+          </label>
+          <div style="flex:0 0 auto;display:flex;align-items:flex-end">
+            <button id="resetDips">Reset all</button>
+          </div>
+        </div>
+        <div id="dipList"></div>
       </div>
     </section>
 
@@ -548,6 +584,8 @@ const state = {
   labels: {},                 // padId -> friendly name (the "layout")
   layoutName: 'generic',
   shader: '',                 // path within the glsl-shaders repo
+  coreVars: {},               // key -> value the core reported at boot
+  coreOptions: {},            // key -> value the user has overridden
   gameName: '',
   editPlayer: 1,
   listening: null,            // {player, padId, kind:'key'|'pad'}
@@ -563,12 +601,100 @@ const $ = id => document.getElementById(id);
 const logEl = $('log');
 
 function log(msg, cls=''){
+  sniffCoreVar(msg);
   const line = document.createElement('div');
   if (cls) line.className = cls;
   line.textContent = msg;
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
+
+/* =====================================================================
+   Core option discovery
+   The core asks RetroArch for every option it cares about at boot, and
+   each request shows up in the log. That is our option list — no
+   hardcoded per-game tables, and it works for whatever core is loaded.
+   What the log does NOT carry is the set of allowed values (those come
+   through SET_CORE_OPTIONS_V2 as structured data), hence free text
+   fields rather than dropdowns.
+   ===================================================================== */
+let dipDirty = false;
+
+function sniffCoreVar(msg){
+  if (typeof msg !== 'string' || !msg.includes('GET_VARIABLE')) return;
+
+  // [DEBUG] [Environ] GET_VARIABLE: some_key = "some value"
+  const set = msg.match(/GET_VARIABLE:\s*(\S+)\s*=\s*"([^"]*)"/);
+  if (set){
+    state.coreVars[set[1]] = set[2];
+    dipDirty = true;
+    return;
+  }
+  // [ERROR] [Environ] GET_VARIABLE: some_key - Invalid value.
+  // The core still wants this option, it just has no value set yet.
+  const unset = msg.match(/GET_VARIABLE:\s*(\S+)\s*-\s*Invalid value/);
+  if (unset && !(unset[1] in state.coreVars)){
+    state.coreVars[unset[1]] = '';
+    dipDirty = true;
+  }
+}
+
+function isDip(key){
+  return /dip|dipsw/i.test(key);
+}
+
+function renderDips(){
+  const list = $('dipList');
+  const onlyDip = $('dipFilter').value === 'dip';
+  list.textContent = '';
+
+  const keys = Object.keys(state.coreVars)
+    .filter(k => !onlyDip || isDip(k))
+    .sort();
+
+  if (!keys.length){
+    list.innerHTML = Object.keys(state.coreVars).length
+      ? '<div class="empty">No DIP switches exposed by this core for this game. Try "All core options".</div>'
+      : '<div class="empty">Start a game — options appear as the core requests them.</div>';
+    return;
+  }
+
+  for (const key of keys){
+    const row = document.createElement('div');
+    row.className = 'dip';
+
+    const current = state.coreOptions[key] ?? state.coreVars[key];
+    if (key in state.coreOptions) row.classList.add('changed');
+
+    const lab = document.createElement('label');
+    // Strip the core's prefix — "mame2003-plus_skip_warnings" reads better
+    // as "skip warnings" once you already know which core you're running.
+    lab.textContent = key.replace(/^[a-z0-9]+(-[a-z0-9]+)*_/i, '').replace(/_/g, ' ');
+    lab.title = key;
+    row.appendChild(lab);
+
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.value = current;
+    inp.placeholder = state.coreVars[key] || '(unset)';
+    inp.addEventListener('input', () => {
+      if (inp.value === state.coreVars[key]) delete state.coreOptions[key];
+      else state.coreOptions[key] = inp.value;
+      row.classList.toggle('changed', key in state.coreOptions);
+    });
+    row.appendChild(inp);
+
+    list.appendChild(row);
+  }
+}
+
+$('dipFilter').addEventListener('change', renderDips);
+
+$('resetDips').addEventListener('click', () => {
+  state.coreOptions = {};
+  renderDips();
+  log('Core options reset — apply to take effect');
+});
 
 /* =====================================================================
    Core selector
@@ -898,6 +1024,7 @@ $('exportLayout').addEventListener('click', () => {
     preset: state.layoutName,
     labels: state.labels,
     shader: state.shader,
+    coreOptions: state.coreOptions,
   }, `${state.gameName || 'layout'}.layout.json`);
   log('Layout exported', 'ok');
 });
@@ -943,6 +1070,10 @@ $('jsonPicker').addEventListener('change', async () => {
         if (data.shader && shaderSelect.value !== data.shader){
           log(`Layout uses shader "${data.shader}" — not in the list, but will be fetched`, 'ok');
         }
+      }
+      if (data.coreOptions && typeof data.coreOptions === 'object'){
+        state.coreOptions = { ...data.coreOptions };
+        renderDips();
       }
       log(`Layout for "${data.game}" imported`, 'ok');
 
@@ -1068,6 +1199,12 @@ async function launch(savedState = null){
     opts.shader = state.shader;
     log(`Shader: ${state.shader}`);
   }
+
+  // DIP switches and other core settings ride in the core option file.
+  if (Object.keys(state.coreOptions).length){
+    opts.retroarchCoreConfig = { ...state.coreOptions };
+    log(`Applying ${Object.keys(state.coreOptions).length} core option(s)`);
+  }
   if (state.bios.length){
     opts.bios = state.bios.map(f => ({ fileName: f.name, fileContent: f }));
   }
@@ -1079,6 +1216,11 @@ async function launch(savedState = null){
   $('applyBtn').disabled = false;
   $('launchBtn').textContent = 'Restart';
   log('Running', 'ok');
+
+  // Options are discovered from the boot log, which is still arriving as
+  // launch() resolves — give it a moment before drawing the list.
+  if (dipDirty) renderDips();
+  setTimeout(() => { if (dipDirty){ renderDips(); dipDirty = false; } }, 1500);
 
   if (savedState){
     try {
@@ -1143,6 +1285,7 @@ $('stopBtn').addEventListener('click', async () => {
    ===================================================================== */
 updatePadStatus();
 renderTable();
+renderDips();
 refreshProfiles();
 log('Ready. Load a ROM to start.');
 </script>
